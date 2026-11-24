@@ -1,0 +1,1567 @@
+name: Build Video Upscaler APK
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write project files
+        run: |
+          mkdir -p project
+          cd project
+          mkdir -p app
+          cat > app/build.gradle.kts <<'__EOF__'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.videoupscaler.app"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.videoupscaler.app"
+                  minSdk = 29
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+              buildFeatures {
+                  viewBinding = true
+              }
+          }
+
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.appcompat:appcompat:1.7.0")
+              implementation("com.google.android.material:material:1.12.0")
+              implementation("androidx.activity:activity-ktx:1.9.1")
+              implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.4")
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+
+              // On-device AI super-resolution
+              implementation("org.tensorflow:tensorflow-lite:2.14.0")
+              implementation("org.tensorflow:tensorflow-lite-gpu:2.14.0")
+              implementation("org.tensorflow:tensorflow-lite-gpu-api:2.14.0")
+          }
+          __EOF__
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'__EOF__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+              <application
+                  android:allowBackup="false"
+                  android:label="Video Upscaler"
+                  android:largeHeap="true"
+                  android:theme="@style/Theme.Upscaler">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".UpscaleService"
+                      android:exported="false"
+                      android:foregroundServiceType="dataSync" />
+              </application>
+          </manifest>
+          __EOF__
+          mkdir -p app/src/main/java/com/videoupscaler/app
+          cat > app/src/main/java/com/videoupscaler/app/FrameUpscalers.kt <<'__EOF__'
+          package com.videoupscaler.app
+
+          import org.tensorflow.lite.DataType
+          import org.tensorflow.lite.Interpreter
+          import org.tensorflow.lite.gpu.GpuDelegate
+          import java.io.File
+          import java.nio.ByteBuffer
+          import java.nio.ByteOrder
+          import kotlin.math.PI
+          import kotlin.math.abs
+          import kotlin.math.ceil
+          import kotlin.math.floor
+          import kotlin.math.max
+          import kotlin.math.min
+          import kotlin.math.sin
+
+          /** A picture as packed ARGB ints. */
+          class Pix(val w: Int, val h: Int, val data: IntArray)
+
+          interface FrameUpscaler : AutoCloseable {
+              fun upscale(src: Pix, outW: Int, outH: Int): Pix
+          }
+
+          /** High quality resizing (Lanczos-3) and sharpening, plain Kotlin. */
+          object Resampler {
+              private class Taps(val start: IntArray, val count: IntArray, val w: FloatArray, val stride: Int)
+
+              private fun lanczos(x: Double): Double {
+                  val ax = abs(x)
+                  if (ax < 1e-9) return 1.0
+                  if (ax >= 3.0) return 0.0
+                  val px = PI * ax
+                  return 3.0 * sin(px) * sin(px / 3.0) / (px * px)
+              }
+
+              private fun makeTaps(inSize: Int, outSize: Int): Taps {
+                  val scale = inSize.toDouble() / outSize
+                  val fs = max(1.0, scale)
+                  val support = 3.0 * fs
+                  val stride = ceil(support * 2).toInt() + 4
+                  val start = IntArray(outSize)
+                  val count = IntArray(outSize)
+                  val w = FloatArray(outSize * stride)
+                  for (o in 0 until outSize) {
+                      val center = (o + 0.5) * scale
+                      val lo = max(0, floor(center - support).toInt())
+                      val hi = min(inSize - 1, ceil(center + support).toInt())
+                      val n = hi - lo + 1
+                      var sum = 0.0
+                      val vals = DoubleArray(n)
+                      for (i in 0 until n) {
+                          vals[i] = lanczos((lo + i + 0.5 - center) / fs)
+                          sum += vals[i]
+                      }
+                      for (i in 0 until n) w[o * stride + i] = (if (sum != 0.0) vals[i] / sum else vals[i]).toFloat()
+                      start[o] = lo
+                      count[o] = n
+                  }
+                  return Taps(start, count, w, stride)
+              }
+
+              private fun clamp255(v: Float): Int {
+                  val i = (v + 0.5f).toInt()
+                  return if (i < 0) 0 else if (i > 255) 255 else i
+              }
+
+              fun resize(src: Pix, outW: Int, outH: Int): Pix {
+                  if (src.w == outW && src.h == outH) return src
+                  val tx = makeTaps(src.w, outW)
+                  val ty = makeTaps(src.h, outH)
+                  val s = src.data
+                  val rowLen = outW * 3
+
+                  // horizontal pass
+                  val tmp = FloatArray(rowLen * src.h)
+                  for (y in 0 until src.h) {
+                      val rowBase = y * src.w
+                      var o = y * rowLen
+                      for (x in 0 until outW) {
+                          var r = 0f
+                          var g = 0f
+                          var b = 0f
+                          val st = tx.start[x]
+                          val n = tx.count[x]
+                          val wb = x * tx.stride
+                          for (i in 0 until n) {
+                              val p = s[rowBase + st + i]
+                              val wt = tx.w[wb + i]
+                              r += wt * ((p shr 16) and 255)
+                              g += wt * ((p shr 8) and 255)
+                              b += wt * (p and 255)
+                          }
+                          tmp[o] = r
+                          tmp[o + 1] = g
+                          tmp[o + 2] = b
+                          o += 3
+                      }
+                  }
+
+                  // vertical pass
+                  val out = IntArray(outW * outH)
+                  val acc = FloatArray(rowLen)
+                  for (y in 0 until outH) {
+                      java.util.Arrays.fill(acc, 0f)
+                      val st = ty.start[y]
+                      val n = ty.count[y]
+                      val wb = y * ty.stride
+                      for (i in 0 until n) {
+                          val wt = ty.w[wb + i]
+                          val base = (st + i) * rowLen
+                          for (k in 0 until rowLen) acc[k] += wt * tmp[base + k]
+                      }
+                      var k = 0
+                      val ob = y * outW
+                      for (x in 0 until outW) {
+                          out[ob + x] = (255 shl 24) or (clamp255(acc[k]) shl 16) or
+                              (clamp255(acc[k + 1]) shl 8) or clamp255(acc[k + 2])
+                          k += 3
+                      }
+                  }
+                  return Pix(outW, outH, out)
+              }
+
+              /** Unsharp mask with a 3x3 blur. amount ~0.3 = subtle, ~0.8 = strong. */
+              fun sharpen(p: Pix, amount: Float): Pix {
+                  if (amount <= 0f) return p
+                  val w = p.w
+                  val h = p.h
+                  val src = p.data
+                  val out = IntArray(src.size)
+                  for (y in 0 until h) {
+                      val r0 = max(y - 1, 0) * w
+                      val r1 = y * w
+                      val r2 = min(y + 1, h - 1) * w
+                      for (x in 0 until w) {
+                          val xl = max(x - 1, 0)
+                          val xr = min(x + 1, w - 1)
+                          val c = src[r1 + x]
+                          var res = 255 shl 24
+                          var shift = 16
+                          while (shift >= 0) {
+                              val cv = (c shr shift) and 255
+                              val blur = (
+                                  ((src[r0 + xl] shr shift) and 255) + ((src[r0 + xr] shr shift) and 255) +
+                                      ((src[r2 + xl] shr shift) and 255) + ((src[r2 + xr] shr shift) and 255) +
+                                      2 * (((src[r0 + x] shr shift) and 255) + ((src[r2 + x] shr shift) and 255) +
+                                          ((src[r1 + xl] shr shift) and 255) + ((src[r1 + xr] shr shift) and 255)) +
+                                      4 * cv
+                                  ) / 16f
+                              val v = cv + amount * (cv - blur)
+                              res = res or (clamp255(v) shl shift)
+                              shift -= 8
+                          }
+                          out[r1 + x] = res
+                      }
+                  }
+                  return Pix(w, h, out)
+              }
+          }
+
+          /** Fast mode: Lanczos resize + sharpening. No new detail, but clean and crisp. */
+          class ClassicUpscaler(private val sharpenAmount: Float = 0.7f) : FrameUpscaler {
+              override fun upscale(src: Pix, outW: Int, outH: Int): Pix =
+                  Resampler.sharpen(Resampler.resize(src, outW, outH), sharpenAmount)
+
+              override fun close() {}
+          }
+
+          /**
+           * AI mode: runs a super-resolution TFLite model (Real-ESRGAN) over overlapping tiles,
+           * then resizes the 4x result to the exact target size.
+           */
+          class AiUpscaler(
+              modelFile: File,
+              useGpu: Boolean = true,
+              private val finalSharpen: Float = 0.25f,
+          ) : FrameUpscaler {
+
+              private var gpuDelegate: GpuDelegate? = null
+              private val interpreter: Interpreter
+              private var nchw = false
+              private var tile = 128
+              private var scale = 4
+              private lateinit var inBuf: ByteBuffer
+              private lateinit var outBuf: ByteBuffer
+              private lateinit var inArr: FloatArray
+              private lateinit var outArr: FloatArray
+
+              var usingGpu = false
+                  private set
+
+              init {
+                  var ip: Interpreter? = null
+                  if (useGpu) {
+                      try {
+                          val d = GpuDelegate()
+                          gpuDelegate = d
+                          ip = Interpreter(modelFile, Interpreter.Options().addDelegate(d))
+                          readShapes(ip)
+                          // warm-up run: proves the GPU path really works on this phone
+                          inBuf.rewind()
+                          outBuf.rewind()
+                          ip.run(inBuf, outBuf)
+                          usingGpu = true
+                      } catch (t: Throwable) {
+                          try { ip?.close() } catch (ignored: Throwable) {}
+                          try { gpuDelegate?.close() } catch (ignored: Throwable) {}
+                          gpuDelegate = null
+                          ip = null
+                      }
+                  }
+                  if (ip == null) {
+                      val threads = max(2, Runtime.getRuntime().availableProcessors() - 1)
+                      val cpu = Interpreter(modelFile, Interpreter.Options().setNumThreads(threads))
+                      readShapes(cpu)
+                      ip = cpu
+                  }
+                  interpreter = checkNotNull(ip)
+              }
+
+              private fun readShapes(ip: Interpreter) {
+                  val inT = ip.getInputTensor(0)
+                  if (inT.dataType() != DataType.FLOAT32) {
+                      throw IllegalStateException("The model must be the float32 version (got ${inT.dataType()}).")
+                  }
+                  val ins = inT.shape()
+                  val outs = ip.getOutputTensor(0).shape()
+                  if (ins.size != 4 || outs.size != 4) {
+                      throw IllegalStateException("Unexpected model shape ${ins.contentToString()}")
+                  }
+                  nchw = ins[1] == 3 && ins[3] != 3
+                  val h = if (nchw) ins[2] else ins[1]
+                  val w = if (nchw) ins[3] else ins[2]
+                  if (h != w) throw IllegalStateException("Model needs square tiles, got ${w}x$h")
+                  val oh = if (nchw) outs[2] else outs[1]
+                  tile = h
+                  scale = oh / h
+                  if (scale < 1) throw IllegalStateException("Model does not enlarge images")
+                  val ot = tile * scale
+                  inBuf = ByteBuffer.allocateDirect(4 * 3 * tile * tile).order(ByteOrder.nativeOrder())
+                  outBuf = ByteBuffer.allocateDirect(4 * 3 * ot * ot).order(ByteOrder.nativeOrder())
+                  inArr = FloatArray(3 * tile * tile)
+                  outArr = FloatArray(3 * ot * ot)
+              }
+
+              private fun clampI(v: Int, lo: Int, hi: Int) = if (v < lo) lo else if (v > hi) hi else v
+
+              private fun to255(v: Float): Int {
+                  val i = (v * 255f + 0.5f).toInt()
+                  return if (i < 0) 0 else if (i > 255) 255 else i
+              }
+
+              override fun upscale(src: Pix, outW: Int, outH: Int): Pix {
+                  val s = scale
+                  val t = tile
+                  val ot = t * s
+                  val bigW = src.w * s
+                  val bigH = src.h * s
+                  val big = IntArray(bigW * bigH)
+                  val pad = 8
+                  val step = t - 2 * pad
+                  val plane = t * t
+                  val oplane = ot * ot
+
+                  var ty = 0
+                  while (ty < src.h) {
+                      var tx = 0
+                      while (tx < src.w) {
+                          val x0 = tx - pad
+                          val y0 = ty - pad
+
+                          // fill the input tile (edges are replicated)
+                          for (yy in 0 until t) {
+                              val rowBase = clampI(y0 + yy, 0, src.h - 1) * src.w
+                              for (xx in 0 until t) {
+                                  val p = src.data[rowBase + clampI(x0 + xx, 0, src.w - 1)]
+                                  val r = ((p shr 16) and 255) / 255f
+                                  val g = ((p shr 8) and 255) / 255f
+                                  val b = (p and 255) / 255f
+                                  if (nchw) {
+                                      val idx = yy * t + xx
+                                      inArr[idx] = r
+                                      inArr[plane + idx] = g
+                                      inArr[2 * plane + idx] = b
+                                  } else {
+                                      val idx = (yy * t + xx) * 3
+                                      inArr[idx] = r
+                                      inArr[idx + 1] = g
+                                      inArr[idx + 2] = b
+                                  }
+                              }
+                          }
+                          inBuf.rewind()
+                          inBuf.asFloatBuffer().put(inArr)
+                          outBuf.rewind()
+                          interpreter.run(inBuf, outBuf)
+                          outBuf.rewind()
+                          outBuf.asFloatBuffer().get(outArr)
+
+                          // copy only the middle of the output tile (the padded border is discarded)
+                          val rw = min(step, src.w - tx)
+                          val rh = min(step, src.h - ty)
+                          for (yy in 0 until rh * s) {
+                              val oy = pad * s + yy
+                              val dst = (ty * s + yy) * bigW + tx * s
+                              for (xx in 0 until rw * s) {
+                                  val ox = pad * s + xx
+                                  val r: Float
+                                  val g: Float
+                                  val b: Float
+                                  if (nchw) {
+                                      val i = oy * ot + ox
+                                      r = outArr[i]
+                                      g = outArr[oplane + i]
+                                      b = outArr[2 * oplane + i]
+                                  } else {
+                                      val i = (oy * ot + ox) * 3
+                                      r = outArr[i]
+                                      g = outArr[i + 1]
+                                      b = outArr[i + 2]
+                                  }
+                                  big[dst + xx] = (255 shl 24) or (to255(r) shl 16) or (to255(g) shl 8) or to255(b)
+                              }
+                          }
+                          tx += step
+                      }
+                      ty += step
+                  }
+
+                  val resized = Resampler.resize(Pix(bigW, bigH, big), outW, outH)
+                  return Resampler.sharpen(resized, finalSharpen)
+              }
+
+              override fun close() {
+                  try { interpreter.close() } catch (ignored: Throwable) {}
+                  try { gpuDelegate?.close() } catch (ignored: Throwable) {}
+              }
+          }
+          __EOF__
+          mkdir -p app/src/main/java/com/videoupscaler/app
+          cat > app/src/main/java/com/videoupscaler/app/JobStore.kt <<'__EOF__'
+          package com.videoupscaler.app
+
+          import android.net.Uri
+          import kotlinx.coroutines.flow.MutableStateFlow
+
+          /** What the screen shows about the running (or finished) job. */
+          data class JobState(
+              val running: Boolean = false,
+              val done: Int = 0,
+              val total: Int = 0,
+              val message: String = "",
+              val etaSeconds: Long = -1,
+              val outputUri: Uri? = null,
+              val error: String? = null,
+          )
+
+          /** Shared between the background service and the screen. */
+          object JobStore {
+              val state = MutableStateFlow(JobState())
+          }
+          __EOF__
+          mkdir -p app/src/main/java/com/videoupscaler/app
+          cat > app/src/main/java/com/videoupscaler/app/MainActivity.kt <<'__EOF__'
+          package com.videoupscaler.app
+
+          import android.Manifest
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.media.MediaMetadataRetriever
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.OpenableColumns
+          import android.view.View
+          import android.widget.Toast
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.core.content.ContextCompat
+          import androidx.lifecycle.Lifecycle
+          import androidx.lifecycle.lifecycleScope
+          import androidx.lifecycle.repeatOnLifecycle
+          import com.videoupscaler.app.databinding.ActivityMainBinding
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withContext
+          import java.io.File
+
+          class MainActivity : AppCompatActivity() {
+
+              private lateinit var ui: ActivityMainBinding
+              private var inputUri: Uri? = null
+              private var busyPreparing = false
+
+              private val pickVideo =
+                  registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+                      if (uri != null) onVideoChosen(uri)
+                  }
+
+              private val pickModel =
+                  registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+                      if (uri != null) importModel(uri)
+                  }
+
+              private val askNotifications =
+                  registerForActivityResult(ActivityResultContracts.RequestPermission()) {
+                      // The job runs either way; this only decides whether the progress notification is visible.
+                      beginJob()
+                  }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  ui = ActivityMainBinding.inflate(layoutInflater)
+                  setContentView(ui.root)
+
+                  ui.btnPick.setOnClickListener { pickVideo.launch(arrayOf("video/*")) }
+                  ui.btnDownload.setOnClickListener { downloadModel() }
+                  ui.btnImport.setOnClickListener { pickModel.launch(arrayOf("*/*")) }
+                  ui.btnStart.setOnClickListener { onStartClicked() }
+                  ui.btnCancel.setOnClickListener {
+                      startService(Intent(this, UpscaleService::class.java).setAction(UpscaleService.ACTION_CANCEL))
+                  }
+                  ui.rgMode.setOnCheckedChangeListener { _, _ -> refreshModelUi() }
+                  refreshModelUi()
+
+                  lifecycleScope.launch {
+                      repeatOnLifecycle(Lifecycle.State.STARTED) {
+                          JobStore.state.collect { render(it) }
+                      }
+                  }
+              }
+
+              // ---------- video selection ----------
+
+              private fun onVideoChosen(uri: Uri) {
+                  inputUri = uri
+                  var name = "video"
+                  contentResolver.query(uri, null, null, null, null)?.use { c ->
+                      val i = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                      if (i >= 0 && c.moveToFirst()) name = c.getString(i)
+                  }
+                  val desc = try {
+                      val m = MediaMetadataRetriever()
+                      m.setDataSource(this, uri)
+                      val w = m.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)
+                      val h = m.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)
+                      val ms = m.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+                      val frames = m.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_FRAME_COUNT)
+                      m.release()
+                      "$name\n${w}x$h, ${ms / 1000}s" + (frames?.let { ", about $it frames" } ?: "")
+                  } catch (e: Exception) {
+                      name
+                  }
+                  ui.tvInput.text = desc
+              }
+
+              // ---------- AI model ----------
+
+              private fun refreshModelUi() {
+                  val ai = ui.rbAi.isChecked
+                  val installed = ModelManager.isInstalled(this)
+                  ui.tvModel.visibility = if (ai) View.VISIBLE else View.GONE
+                  ui.btnDownload.visibility = if (ai && !installed) View.VISIBLE else View.GONE
+                  ui.btnImport.visibility = if (ai && !installed) View.VISIBLE else View.GONE
+                  ui.tvModel.text = if (installed) "AI model: installed ✓" else "AI model: not installed yet"
+              }
+
+              private fun downloadModel() {
+                  ui.btnDownload.isEnabled = false
+                  ui.tvModel.text = "Downloading AI model…"
+                  lifecycleScope.launch {
+                      try {
+                          withContext(Dispatchers.IO) {
+                              ModelManager.download(applicationContext) { p ->
+                                  runOnUiThread { ui.tvModel.text = "Downloading AI model… $p%" }
+                              }
+                          }
+                      } catch (e: Exception) {
+                          Toast.makeText(
+                              this@MainActivity,
+                              "Download failed: ${e.message}. Check your internet and try again.",
+                              Toast.LENGTH_LONG,
+                          ).show()
+                      }
+                      ui.btnDownload.isEnabled = true
+                      refreshModelUi()
+                  }
+              }
+
+              private fun importModel(uri: Uri) {
+                  lifecycleScope.launch {
+                      try {
+                          withContext(Dispatchers.IO) { ModelManager.importFromUri(applicationContext, uri) }
+                      } catch (e: Exception) {
+                          Toast.makeText(this@MainActivity, "Could not use that file: ${e.message}", Toast.LENGTH_LONG).show()
+                      }
+                      refreshModelUi()
+                  }
+              }
+
+              // ---------- start / run ----------
+
+              private fun onStartClicked() {
+                  if (inputUri == null) {
+                      Toast.makeText(this, "Choose a video first", Toast.LENGTH_SHORT).show()
+                      return
+                  }
+                  if (ui.rbAi.isChecked && !ModelManager.isInstalled(this)) {
+                      Toast.makeText(this, "Download the AI model first (or pick Classic)", Toast.LENGTH_LONG).show()
+                      return
+                  }
+                  if (Build.VERSION.SDK_INT >= 33 &&
+                      ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) !=
+                      PackageManager.PERMISSION_GRANTED
+                  ) {
+                      askNotifications.launch(Manifest.permission.POST_NOTIFICATIONS)
+                  } else {
+                      beginJob()
+                  }
+              }
+
+              private fun beginJob() {
+                  val uri = inputUri ?: return
+                  if (busyPreparing || JobStore.state.value.running) return
+                  busyPreparing = true
+                  ui.btnStart.isEnabled = false
+                  ui.tvStatus.text = "Copying the video…"
+                  val short = when {
+                      ui.rb720.isChecked -> 720
+                      ui.rb1440.isChecked -> 1440
+                      ui.rb2160.isChecked -> 2160
+                      else -> 1080
+                  }
+                  val ai = ui.rbAi.isChecked
+                  lifecycleScope.launch {
+                      try {
+                          val copy = File(cacheDir, "input.mp4")
+                          withContext(Dispatchers.IO) {
+                              val input = contentResolver.openInputStream(uri) ?: throw IllegalStateException("Cannot open the video")
+                              input.use { i -> copy.outputStream().use { o -> i.copyTo(o) } }
+                          }
+                          val intent = Intent(this@MainActivity, UpscaleService::class.java)
+                              .setAction(UpscaleService.ACTION_START)
+                              .putExtra(UpscaleService.EXTRA_INPUT, copy.absolutePath)
+                              .putExtra(UpscaleService.EXTRA_SHORT_SIDE, short)
+                              .putExtra(UpscaleService.EXTRA_AI, ai)
+                          JobStore.state.value = JobState(running = true, message = "Starting…")
+                          ContextCompat.startForegroundService(this@MainActivity, intent)
+                      } catch (e: Exception) {
+                          ui.tvStatus.text = "Could not start: ${e.message}"
+                          ui.btnStart.isEnabled = true
+                      } finally {
+                          busyPreparing = false
+                      }
+                  }
+              }
+
+              // ---------- screen state ----------
+
+              private fun render(s: JobState) {
+                  ui.btnStart.isEnabled = !s.running && !busyPreparing
+                  ui.btnCancel.isEnabled = s.running
+                  if (s.total > 0) {
+                      ui.progress.max = s.total
+                      ui.progress.progress = s.done
+                      ui.progress.isIndeterminate = false
+                  } else {
+                      ui.progress.isIndeterminate = s.running
+                      if (!s.running) ui.progress.progress = 0
+                  }
+                  val sb = StringBuilder(s.message)
+                  if (s.running && s.total > 0) {
+                      sb.append("\nFrame ${s.done} of ${s.total}")
+                      if (s.etaSeconds >= 0) sb.append("\nTime left: ").append(formatEta(s.etaSeconds))
+                      sb.append("\nYou can leave the app or turn off the screen. It keeps working.")
+                  }
+                  if (s.error != null) sb.append("\n").append(s.error)
+                  ui.tvStatus.text = sb.toString()
+
+                  val out = s.outputUri
+                  ui.btnOpen.visibility = if (out != null) View.VISIBLE else View.GONE
+                  ui.btnOpen.setOnClickListener {
+                      if (out != null) {
+                          startActivity(
+                              Intent(Intent.ACTION_VIEW)
+                                  .setDataAndType(out, "video/mp4")
+                                  .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION),
+                          )
+                      }
+                  }
+              }
+
+              private fun formatEta(sec: Long): String {
+                  val h = sec / 3600
+                  val m = (sec % 3600) / 60
+                  return if (h > 0) "${h}h ${m}m" else if (m > 0) "${m}m" else "${sec}s"
+              }
+          }
+          __EOF__
+          mkdir -p app/src/main/java/com/videoupscaler/app
+          cat > app/src/main/java/com/videoupscaler/app/ModelManager.kt <<'__EOF__'
+          package com.videoupscaler.app
+
+          import android.content.Context
+          import android.net.Uri
+          import java.io.File
+          import java.io.IOException
+          import java.net.HttpURLConnection
+          import java.net.URL
+          import java.util.zip.ZipInputStream
+
+          /**
+           * Real-ESRGAN General x4v3 (BSD-3-Clause) as a float TFLite model, published by Qualcomm AI Hub.
+           * The download is a small zip that contains the .tflite file.
+           */
+          object ModelManager {
+              const val MODEL_ZIP_URL =
+                  "https://qaihub-public-assets.s3.us-west-2.amazonaws.com/qai-hub-models/models/" +
+                      "real_esrgan_general_x4v3/releases/v0.67.0/real_esrgan_general_x4v3-tflite-float.zip"
+
+              private fun dir(context: Context) = File(context.filesDir, "models").also { it.mkdirs() }
+
+              fun modelFile(context: Context) = File(dir(context), "sr_model.tflite")
+
+              fun isInstalled(context: Context): Boolean {
+                  val f = modelFile(context)
+                  return f.exists() && f.length() > 100_000
+              }
+
+              fun download(context: Context, onProgress: (Int) -> Unit) {
+                  val tmp = File(dir(context), "download.zip")
+                  val conn = URL(MODEL_ZIP_URL).openConnection() as HttpURLConnection
+                  conn.connectTimeout = 20_000
+                  conn.readTimeout = 60_000
+                  try {
+                      if (conn.responseCode != 200) throw IOException("Download failed (HTTP ${conn.responseCode})")
+                      val total = conn.contentLength
+                      conn.inputStream.use { input ->
+                          tmp.outputStream().use { out ->
+                              val buf = ByteArray(64 * 1024)
+                              var read: Int
+                              var sum = 0L
+                              while (input.read(buf).also { read = it } >= 0) {
+                                  out.write(buf, 0, read)
+                                  sum += read
+                                  if (total > 0) onProgress((sum * 100 / total).toInt())
+                              }
+                          }
+                      }
+                  } finally {
+                      conn.disconnect()
+                  }
+                  extractTflite(tmp, modelFile(context))
+                  tmp.delete()
+              }
+
+              /** Lets the user pick a model file themselves (.tflite, or the .zip as downloaded). */
+              fun importFromUri(context: Context, uri: Uri) {
+                  val tmp = File(dir(context), "import.bin")
+                  val input = context.contentResolver.openInputStream(uri) ?: throw IOException("Cannot open that file")
+                  input.use { i -> tmp.outputStream().use { o -> i.copyTo(o) } }
+                  val head = ByteArray(2)
+                  tmp.inputStream().use { it.read(head) }
+                  if (head[0] == 'P'.code.toByte() && head[1] == 'K'.code.toByte()) {
+                      extractTflite(tmp, modelFile(context))
+                  } else {
+                      tmp.copyTo(modelFile(context), overwrite = true)
+                  }
+                  tmp.delete()
+              }
+
+              private fun extractTflite(zip: File, dest: File) {
+                  ZipInputStream(zip.inputStream().buffered()).use { zis ->
+                      var e = zis.nextEntry
+                      while (e != null) {
+                          if (!e.isDirectory && e.name.endsWith(".tflite")) {
+                              dest.outputStream().use { zis.copyTo(it) }
+                              return
+                          }
+                          e = zis.nextEntry
+                      }
+                  }
+                  throw IOException("No .tflite file found inside the zip")
+              }
+          }
+          __EOF__
+          mkdir -p app/src/main/java/com/videoupscaler/app
+          cat > app/src/main/java/com/videoupscaler/app/UpscaleService.kt <<'__EOF__'
+          package com.videoupscaler.app
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.ContentValues
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.net.Uri
+          import android.os.Environment
+          import android.os.IBinder
+          import android.os.PowerManager
+          import android.provider.MediaStore
+          import androidx.core.app.NotificationCompat
+          import kotlinx.coroutines.CancellationException
+          import kotlinx.coroutines.CoroutineScope
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.Job
+          import kotlinx.coroutines.SupervisorJob
+          import kotlinx.coroutines.cancel
+          import kotlinx.coroutines.ensureActive
+          import kotlinx.coroutines.launch
+          import java.io.File
+          import java.io.IOException
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+
+          /** Runs the upscaling in the background (foreground service) so it survives screen-off and app switching. */
+          class UpscaleService : Service() {
+
+              companion object {
+                  const val ACTION_START = "com.videoupscaler.app.START"
+                  const val ACTION_CANCEL = "com.videoupscaler.app.CANCEL"
+                  const val EXTRA_INPUT = "input"
+                  const val EXTRA_SHORT_SIDE = "short_side"
+                  const val EXTRA_AI = "ai"
+                  private const val CHANNEL = "upscale"
+                  private const val NOTIF_ID = 1
+              }
+
+              private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+              private var job: Job? = null
+              private var wakeLock: PowerManager.WakeLock? = null
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  if (intent?.action == ACTION_CANCEL) {
+                      job?.cancel()
+                      return START_NOT_STICKY
+                  }
+                  createChannel()
+                  startForeground(
+                      NOTIF_ID,
+                      buildNotification("Starting…", 0, 0, true),
+                      ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
+                  )
+                  if (job?.isActive == true) return START_NOT_STICKY
+
+                  val inputPath = intent?.getStringExtra(EXTRA_INPUT)
+                  if (intent == null || inputPath == null) {
+                      stopSelf()
+                      return START_NOT_STICKY
+                  }
+                  val shortSide = intent.getIntExtra(EXTRA_SHORT_SIDE, 1080)
+                  val useAi = intent.getBooleanExtra(EXTRA_AI, true)
+
+                  wakeLock = (getSystemService(POWER_SERVICE) as PowerManager)
+                      .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "videoupscaler:job")
+                      .apply { acquire(24 * 60 * 60 * 1000L) }
+
+                  job = scope.launch {
+                      JobStore.state.value = JobState(running = true, message = "Preparing…")
+                      val started = System.currentTimeMillis()
+                      var lastNotify = 0L
+                      var tempOut: File? = null
+                      try {
+                          val upscaler: FrameUpscaler =
+                              if (useAi) AiUpscaler(ModelManager.modelFile(this@UpscaleService)) else ClassicUpscaler()
+                          upscaler.use { up ->
+                              val tmp = File(cacheDir, "out_${System.currentTimeMillis()}.mp4")
+                              tempOut = tmp
+                              val mode = if (useAi) {
+                                  "AI" + if ((up as? AiUpscaler)?.usingGpu == true) " (GPU)" else " (CPU)"
+                              } else "Classic"
+                              val audioOk = VideoUpscaler().run(
+                                  File(inputPath), tmp, shortSide, up,
+                                  checkCancel = { ensureActive() },
+                              ) { done, total ->
+                                  val elapsed = (System.currentTimeMillis() - started) / 1000.0
+                                  val eta = if (done > 0) (elapsed / done * (total - done)).toLong() else -1L
+                                  JobStore.state.value = JobState(
+                                      running = true, done = done, total = total, etaSeconds = eta,
+                                      message = "$mode upscaling…",
+                                  )
+                                  val now = System.currentTimeMillis()
+                                  if (now - lastNotify > 1000) {
+                                      lastNotify = now
+                                      postNotification(buildNotification("$mode · frame $done of $total", done, total, false))
+                                  }
+                              }
+                              JobStore.state.value = JobState(running = true, message = "Saving to gallery…")
+                              val uri = saveToGallery(tmp)
+                              JobStore.state.value = JobState(
+                                  running = false,
+                                  message = "Done! Saved in Movies/Upscaler." + if (!audioOk) " (No audio was copied.)" else "",
+                                  outputUri = uri,
+                              )
+                          }
+                      } catch (e: CancellationException) {
+                          JobStore.state.value = JobState(running = false, message = "Cancelled.")
+                      } catch (e: Throwable) {
+                          JobStore.state.value = JobState(
+                              running = false,
+                              message = "Failed.",
+                              error = (e.message ?: e.javaClass.simpleName),
+                          )
+                      } finally {
+                          tempOut?.delete()
+                          File(inputPath).delete()
+                          try { wakeLock?.release() } catch (ignored: Throwable) {}
+                          stopForeground(STOP_FOREGROUND_REMOVE)
+                          val s = JobStore.state.value
+                          postNotification(
+                              buildNotification(s.error?.let { "Failed: $it" } ?: s.message, 0, 0, false, ongoing = false),
+                          )
+                          stopSelf()
+                      }
+                  }
+                  return START_NOT_STICKY
+              }
+
+              override fun onDestroy() {
+                  scope.cancel()
+                  try { wakeLock?.release() } catch (ignored: Throwable) {}
+                  super.onDestroy()
+              }
+
+              private fun postNotification(n: Notification) {
+                  try {
+                      getSystemService(NotificationManager::class.java).notify(NOTIF_ID, n)
+                  } catch (ignored: Throwable) {}
+              }
+
+              private fun createChannel() {
+                  val ch = NotificationChannel(CHANNEL, "Upscaling", NotificationManager.IMPORTANCE_LOW)
+                  getSystemService(NotificationManager::class.java).createNotificationChannel(ch)
+              }
+
+              private fun buildNotification(
+                  text: String,
+                  done: Int,
+                  total: Int,
+                  indeterminate: Boolean,
+                  ongoing: Boolean = true,
+              ): Notification {
+                  val open = PendingIntent.getActivity(
+                      this, 0, Intent(this, MainActivity::class.java),
+                      PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+                  )
+                  val b = NotificationCompat.Builder(this, CHANNEL)
+                      .setSmallIcon(android.R.drawable.stat_sys_download)
+                      .setContentTitle("Video Upscaler")
+                      .setContentText(text)
+                      .setContentIntent(open)
+                      .setOngoing(ongoing)
+                      .setOnlyAlertOnce(true)
+                  if (ongoing) {
+                      if (total > 0) b.setProgress(total, done, false) else b.setProgress(0, 0, indeterminate)
+                      val cancel = PendingIntent.getService(
+                          this, 1, Intent(this, UpscaleService::class.java).setAction(ACTION_CANCEL),
+                          PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+                      )
+                      b.addAction(android.R.drawable.ic_menu_close_clear_cancel, "Cancel", cancel)
+                  }
+                  return b.build()
+              }
+
+              private fun saveToGallery(file: File): Uri {
+                  val name = "Upscaled_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".mp4"
+                  val values = ContentValues().apply {
+                      put(MediaStore.Video.Media.DISPLAY_NAME, name)
+                      put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                      put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES + "/Upscaler")
+                      put(MediaStore.Video.Media.IS_PENDING, 1)
+                  }
+                  val resolver = contentResolver
+                  val uri = resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
+                      ?: throw IOException("Could not create the file in your gallery")
+                  val out = resolver.openOutputStream(uri) ?: throw IOException("Could not write to your gallery")
+                  out.use { o -> file.inputStream().use { it.copyTo(o) } }
+                  values.clear()
+                  values.put(MediaStore.Video.Media.IS_PENDING, 0)
+                  resolver.update(uri, values, null, null)
+                  return uri
+              }
+          }
+          __EOF__
+          mkdir -p app/src/main/java/com/videoupscaler/app
+          cat > app/src/main/java/com/videoupscaler/app/VideoUpscaler.kt <<'__EOF__'
+          package com.videoupscaler.app
+
+          import android.graphics.Bitmap
+          import android.media.Image
+          import android.media.MediaCodec
+          import android.media.MediaCodecInfo
+          import android.media.MediaCodecList
+          import android.media.MediaExtractor
+          import android.media.MediaFormat
+          import android.media.MediaMetadataRetriever
+          import android.media.MediaMuxer
+          import java.io.File
+          import java.io.IOException
+          import java.nio.ByteBuffer
+          import kotlin.math.max
+          import kotlin.math.min
+          import kotlin.math.roundToInt
+
+          /**
+           * Pipeline: read every frame of the video -> upscale it -> encode into a new MP4 with the
+           * original audio copied over untouched. Frame timestamps are preserved.
+           */
+          class VideoUpscaler {
+
+              /** @return true if the audio track was copied into the result. */
+              fun run(
+                  input: File,
+                  output: File,
+                  targetShortSide: Int,
+                  upscaler: FrameUpscaler,
+                  checkCancel: () -> Unit,
+                  onProgress: (done: Int, total: Int) -> Unit,
+              ): Boolean {
+                  // 1. exact timestamp of every video frame
+                  val ptsList = ArrayList<Long>()
+                  val ex = MediaExtractor()
+                  try {
+                      ex.setDataSource(input.absolutePath)
+                      var vIdx = -1
+                      for (i in 0 until ex.trackCount) {
+                          val mime = ex.getTrackFormat(i).getString(MediaFormat.KEY_MIME) ?: ""
+                          if (mime.startsWith("video/")) {
+                              vIdx = i
+                              break
+                          }
+                      }
+                      if (vIdx < 0) throw IOException("This file has no video track")
+                      ex.selectTrack(vIdx)
+                      while (true) {
+                          val t = ex.sampleTime
+                          if (t < 0) break
+                          ptsList.add(t)
+                          if (!ex.advance()) break
+                      }
+                  } finally {
+                      ex.release()
+                  }
+                  val pts = ptsList.sorted().distinct()
+                  if (pts.isEmpty()) throw IOException("Could not read any video frames")
+                  val total = pts.size
+
+                  val fps = if (total > 1 && pts.last() > pts.first()) {
+                      ((total - 1) * 1_000_000.0 / (pts.last() - pts.first())).roundToInt().coerceIn(1, 60)
+                  } else 30
+
+                  val mmr = MediaMetadataRetriever()
+                  var writer: Mp4Writer? = null
+                  try {
+                      mmr.setDataSource(input.absolutePath)
+
+                      // 2. first frame decides the output size
+                      var firstBmp: Bitmap? = null
+                      var k = 0
+                      while (firstBmp == null && k < pts.size && k < 30) {
+                          firstBmp = mmr.getFrameAtTime(pts[k], MediaMetadataRetriever.OPTION_CLOSEST)
+                          k++
+                      }
+                      val first = toPix(firstBmp ?: throw IOException("Could not decode the first frame"))
+                      val scale = targetShortSide.toDouble() / min(first.w, first.h)
+                      val outW = even((first.w * scale).roundToInt())
+                      val outH = even((first.h * scale).roundToInt())
+
+                      writer = Mp4Writer(output.absolutePath, outW, outH, fps, input)
+
+                      // 3. frame loop
+                      var lastSrc: Pix? = null
+                      var lastUp: Pix? = null
+                      for ((i, t) in pts.withIndex()) {
+                          checkCancel()
+                          val bmp = if (i == 0) null else mmr.getFrameAtTime(t, MediaMetadataRetriever.OPTION_CLOSEST)
+                          val src: Pix = when {
+                              i == 0 -> first
+                              bmp != null -> toPix(bmp)
+                              lastSrc != null -> lastSrc
+                              else -> throw IOException("Could not decode frame $i")
+                          }
+                          val up: Pix =
+                              if (lastSrc != null && lastUp != null && src.w == lastSrc.w && src.h == lastSrc.h &&
+                                  src.data.contentEquals(lastSrc.data)
+                              ) {
+                                  lastUp // identical to the previous frame: reuse
+                              } else {
+                                  val raw = upscaler.upscale(src, outW, outH)
+                                  raw
+                              }
+                          lastSrc = src
+                          lastUp = up
+                          writer.feed(up.data, t)
+                          onProgress(i + 1, total)
+                      }
+
+                      writer.finish()
+                      return writer.audioCopied
+                  } finally {
+                      try { mmr.release() } catch (ignored: Throwable) {}
+                      try { writer?.close() } catch (ignored: Throwable) {}
+                  }
+              }
+
+              private fun even(v: Int) = if (v % 2 == 0) v else v + 1
+
+              private fun toPix(bmp: Bitmap): Pix {
+                  val b = if (bmp.config == Bitmap.Config.ARGB_8888) bmp else bmp.copy(Bitmap.Config.ARGB_8888, false)
+                  val w = b.width
+                  val h = b.height
+                  val arr = IntArray(w * h)
+                  b.getPixels(arr, 0, w, 0, 0, w, h)
+                  if (b !== bmp) b.recycle()
+                  bmp.recycle()
+                  return Pix(w, h, arr)
+              }
+          }
+
+          /** Hardware H.264/H.265 encoder fed with raw frames, muxed into MP4 together with the original audio. */
+          private class Mp4Writer(
+              outPath: String,
+              private val w: Int,
+              private val h: Int,
+              fps: Int,
+              private val audioSource: File?,
+          ) : AutoCloseable {
+
+              private val muxer = MediaMuxer(outPath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG4)
+              private val info = MediaCodec.BufferInfo()
+              private var videoTrack = -1
+              private var audioTrack = -1
+              private var audioEx: MediaExtractor? = null
+              private var muxerStarted = false
+              private var muxerStopped = false
+              var audioCopied = false
+                  private set
+
+              private val codec: MediaCodec = createEncoder(fps)
+
+              private fun createEncoder(fps: Int): MediaCodec {
+                  val list = MediaCodecList(MediaCodecList.REGULAR_CODECS)
+                  val avc = MediaFormat.MIMETYPE_VIDEO_AVC
+                  val hevc = MediaFormat.MIMETYPE_VIDEO_HEVC
+                  val mimes = if (max(w, h) > 1920) arrayOf(hevc, avc) else arrayOf(avc, hevc)
+                  for (mime in mimes) {
+                      val bpp = if (mime == hevc) 0.10 else 0.15
+                      val bitrate = (w.toLong() * h * fps * bpp).toLong().coerceIn(3_000_000L, 90_000_000L).toInt()
+                      val basic = MediaFormat.createVideoFormat(mime, w, h).apply {
+                          setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
+                          setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
+                          setInteger(MediaFormat.KEY_FRAME_RATE, fps)
+                          setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+                      }
+                      val name = list.findEncoderForFormat(basic) ?: continue
+                      for (attempt in 0..1) {
+                          val c = MediaCodec.createByCodecName(name)
+                          try {
+                              val fmt = MediaFormat(basic)
+                              if (attempt == 0) {
+                                  fmt.setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
+                                  fmt.setInteger(MediaFormat.KEY_COLOR_STANDARD, MediaFormat.COLOR_STANDARD_BT709)
+                                  fmt.setInteger(MediaFormat.KEY_COLOR_RANGE, MediaFormat.COLOR_RANGE_LIMITED)
+                                  fmt.setInteger(MediaFormat.KEY_COLOR_TRANSFER, MediaFormat.COLOR_TRANSFER_SDR_VIDEO)
+                              }
+                              c.configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                              c.start()
+                              return c
+                          } catch (e: Exception) {
+                              try { c.release() } catch (ignored: Throwable) {}
+                          }
+                      }
+                  }
+                  throw IOException("This phone cannot encode ${w}x$h video")
+              }
+
+              fun feed(argb: IntArray, ptsUs: Long) {
+                  var idx = -1
+                  var spins = 0
+                  while (idx < 0) {
+                      idx = codec.dequeueInputBuffer(10_000)
+                      if (idx < 0) {
+                          drain(false)
+                          if (++spins > 3000) throw IOException("Video encoder stopped responding")
+                      }
+                  }
+                  val image = codec.getInputImage(idx) ?: throw IOException("Encoder does not accept raw frames on this phone")
+                  writeYuv(image, argb)
+                  codec.queueInputBuffer(idx, 0, w * h * 3 / 2, ptsUs, 0)
+                  drain(false)
+              }
+
+              fun finish() {
+                  var idx = -1
+                  var spins = 0
+                  while (idx < 0) {
+                      idx = codec.dequeueInputBuffer(10_000)
+                      if (idx < 0) {
+                          drain(false)
+                          if (++spins > 3000) throw IOException("Video encoder stopped responding")
+                      }
+                  }
+                  codec.queueInputBuffer(idx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                  drain(true)
+                  writeAudio()
+                  muxer.stop()
+                  muxerStopped = true
+              }
+
+              private fun drain(untilEos: Boolean) {
+                  var idle = 0
+                  while (true) {
+                      val idx = codec.dequeueOutputBuffer(info, if (untilEos) 10_000L else 0L)
+                      if (idx == MediaCodec.INFO_TRY_AGAIN_LATER) {
+                          if (!untilEos) return
+                          if (++idle > 3000) throw IOException("Video encoder did not finish")
+                      } else if (idx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                          startMuxer(codec.outputFormat)
+                      } else if (idx >= 0) {
+                          idle = 0
+                          val buf = codec.getOutputBuffer(idx)
+                          if ((info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) info.size = 0
+                          if (info.size > 0 && buf != null) {
+                              if (!muxerStarted) throw IllegalStateException("Encoder produced data before its format")
+                              buf.position(info.offset)
+                              buf.limit(info.offset + info.size)
+                              muxer.writeSampleData(videoTrack, buf, info)
+                          }
+                          codec.releaseOutputBuffer(idx, false)
+                          if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) return
+                      }
+                  }
+              }
+
+              private fun startMuxer(videoFormat: MediaFormat) {
+                  videoTrack = muxer.addTrack(videoFormat)
+                  if (audioSource != null) {
+                      val ex = MediaExtractor()
+                      try {
+                          ex.setDataSource(audioSource.absolutePath)
+                          var idx = -1
+                          for (i in 0 until ex.trackCount) {
+                              val mime = ex.getTrackFormat(i).getString(MediaFormat.KEY_MIME) ?: ""
+                              if (mime.startsWith("audio/")) {
+                                  idx = i
+                                  break
+                              }
+                          }
+                          if (idx >= 0) {
+                              audioTrack = muxer.addTrack(ex.getTrackFormat(idx))
+                              ex.selectTrack(idx)
+                              audioEx = ex
+                          } else {
+                              ex.release()
+                          }
+                      } catch (e: Exception) {
+                          audioTrack = -1
+                          audioEx = null
+                          try { ex.release() } catch (ignored: Throwable) {}
+                      }
+                  }
+                  muxer.start()
+                  muxerStarted = true
+              }
+
+              private fun writeAudio() {
+                  val ex = audioEx ?: return
+                  if (audioTrack < 0) return
+                  val buf = ByteBuffer.allocate(1 shl 20)
+                  val bi = MediaCodec.BufferInfo()
+                  ex.seekTo(0, MediaExtractor.SEEK_TO_CLOSEST_SYNC)
+                  while (true) {
+                      val n = ex.readSampleData(buf, 0)
+                      if (n < 0) break
+                      val flags = if ((ex.sampleFlags and MediaExtractor.SAMPLE_FLAG_SYNC) != 0)
+                          MediaCodec.BUFFER_FLAG_KEY_FRAME else 0
+                      bi.set(0, n, ex.sampleTime, flags)
+                      muxer.writeSampleData(audioTrack, buf, bi)
+                      if (!ex.advance()) break
+                  }
+                  audioCopied = true
+              }
+
+              private fun clamp(v: Int, lo: Int, hi: Int) = if (v < lo) lo else if (v > hi) hi else v
+
+              /** ARGB -> YUV 4:2:0 (BT.709, limited range) straight into the encoder's input image. */
+              private fun writeYuv(image: Image, argb: IntArray) {
+                  val yp = image.planes[0]
+                  val up = image.planes[1]
+                  val vp = image.planes[2]
+                  val yBuf = yp.buffer
+                  val uBuf = up.buffer
+                  val vBuf = vp.buffer
+                  val yRs = yp.rowStride
+                  val yPs = yp.pixelStride
+                  val uRs = up.rowStride
+                  val uPs = up.pixelStride
+                  val vRs = vp.rowStride
+                  val vPs = vp.pixelStride
+
+                  var j = 0
+                  while (j < h) {
+                      var i = 0
+                      while (i < w) {
+                          var rs = 0
+                          var gs = 0
+                          var bs = 0
+                          for (dy in 0..1) {
+                              for (dx in 0..1) {
+                                  val c = argb[(j + dy) * w + (i + dx)]
+                                  val r = (c shr 16) and 255
+                                  val g = (c shr 8) and 255
+                                  val b = c and 255
+                                  rs += r
+                                  gs += g
+                                  bs += b
+                                  val y = ((47 * r + 157 * g + 16 * b + 128) shr 8) + 16
+                                  yBuf.put((j + dy) * yRs + (i + dx) * yPs, clamp(y, 16, 235).toByte())
+                              }
+                          }
+                          val r = rs shr 2
+                          val g = gs shr 2
+                          val b = bs shr 2
+                          val cb = ((-26 * r - 87 * g + 112 * b + 128) shr 8) + 128
+                          val cr = ((112 * r - 102 * g - 10 * b + 128) shr 8) + 128
+                          uBuf.put((j shr 1) * uRs + (i shr 1) * uPs, clamp(cb, 16, 240).toByte())
+                          vBuf.put((j shr 1) * vRs + (i shr 1) * vPs, clamp(cr, 16, 240).toByte())
+                          i += 2
+                      }
+                      j += 2
+                  }
+              }
+
+              override fun close() {
+                  try { codec.stop() } catch (ignored: Throwable) {}
+                  try { codec.release() } catch (ignored: Throwable) {}
+                  try { if (muxerStarted && !muxerStopped) muxer.stop() } catch (ignored: Throwable) {}
+                  try { muxer.release() } catch (ignored: Throwable) {}
+                  try { audioEx?.release() } catch (ignored: Throwable) {}
+              }
+          }
+          __EOF__
+          mkdir -p app/src/main/res/layout
+          cat > app/src/main/res/layout/activity_main.xml <<'__EOF__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:fillViewport="true">
+
+              <LinearLayout
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:orientation="vertical"
+                  android:padding="20dp">
+
+                  <TextView
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:text="Video Upscaler"
+                      android:textSize="26sp"
+                      android:textStyle="bold" />
+
+                  <TextView
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:layout_marginBottom="16dp"
+                      android:text="Turn low-resolution videos into sharp HD, 2K or 4K." />
+
+                  <Button
+                      android:id="@+id/btnPick"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:text="1. Choose a video" />
+
+                  <TextView
+                      android:id="@+id/tvInput"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="6dp"
+                      android:text="No video selected" />
+
+                  <TextView
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="20dp"
+                      android:text="2. Output quality"
+                      android:textStyle="bold" />
+
+                  <RadioGroup
+                      android:id="@+id/rgRes"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content">
+
+                      <RadioButton
+                          android:id="@+id/rb720"
+                          android:layout_width="wrap_content"
+                          android:layout_height="wrap_content"
+                          android:text="HD 720p" />
+
+                      <RadioButton
+                          android:id="@+id/rb1080"
+                          android:layout_width="wrap_content"
+                          android:layout_height="wrap_content"
+                          android:checked="true"
+                          android:text="Full HD 1080p (best for YouTube / TikTok)" />
+
+                      <RadioButton
+                          android:id="@+id/rb1440"
+                          android:layout_width="wrap_content"
+                          android:layout_height="wrap_content"
+                          android:text="2K 1440p" />
+
+                      <RadioButton
+                          android:id="@+id/rb2160"
+                          android:layout_width="wrap_content"
+                          android:layout_height="wrap_content"
+                          android:text="4K 2160p" />
+                  </RadioGroup>
+
+                  <TextView
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="16dp"
+                      android:text="3. Method"
+                      android:textStyle="bold" />
+
+                  <RadioGroup
+                      android:id="@+id/rgMode"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content">
+
+                      <RadioButton
+                          android:id="@+id/rbAi"
+                          android:layout_width="wrap_content"
+                          android:layout_height="wrap_content"
+                          android:checked="true"
+                          android:text="AI (sharpest, very slow)" />
+
+                      <RadioButton
+                          android:id="@+id/rbClassic"
+                          android:layout_width="wrap_content"
+                          android:layout_height="wrap_content"
+                          android:text="Classic (fast, less detail)" />
+                  </RadioGroup>
+
+                  <TextView
+                      android:id="@+id/tvModel"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="8dp"
+                      android:text="AI model: checking…" />
+
+                  <Button
+                      android:id="@+id/btnDownload"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:text="Download AI model (about 5 MB)" />
+
+                  <Button
+                      android:id="@+id/btnImport"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:text="Use my own model file instead"
+                      style="@style/Widget.MaterialComponents.Button.TextButton" />
+
+                  <Button
+                      android:id="@+id/btnStart"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="20dp"
+                      android:text="4. Start upscaling" />
+
+                  <Button
+                      android:id="@+id/btnCancel"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:enabled="false"
+                      android:text="Cancel"
+                      style="@style/Widget.MaterialComponents.Button.OutlinedButton" />
+
+                  <ProgressBar
+                      android:id="@+id/progress"
+                      style="?android:attr/progressBarStyleHorizontal"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="16dp" />
+
+                  <TextView
+                      android:id="@+id/tvStatus"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="8dp"
+                      android:text="Ready." />
+
+                  <Button
+                      android:id="@+id/btnOpen"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="8dp"
+                      android:text="Open result"
+                      android:visibility="gone" />
+              </LinearLayout>
+          </ScrollView>
+          __EOF__
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/themes.xml <<'__EOF__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="Theme.Upscaler" parent="Theme.MaterialComponents.DayNight.NoActionBar" />
+          </resources>
+          __EOF__
+          cat > build.gradle.kts <<'__EOF__'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          __EOF__
+          cat > gradle.properties <<'__EOF__'
+          org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          android.nonTransitiveRClass=true
+          __EOF__
+          cat > settings.gradle.kts <<'__EOF__'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "VideoUpscaler"
+          include(":app")
+          __EOF__
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: android-actions/setup-android@v3
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+
+      - name: Build debug APK
+        working-directory: project
+        run: gradle assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VideoUpscaler-apk
+          path: project/app/build/outputs/apk/debug/app-debug.apk
